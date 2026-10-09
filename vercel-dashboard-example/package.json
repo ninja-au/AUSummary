@@ -1,0 +1,17 @@
+{
+  "name": "ausummary-dashboard",
+  "version": "1.0.0",
+  "description": "Global statistics dashboard for AUSUMMARY mod",
+  "scripts": {
+    "dev": "vercel dev",
+    "build": "echo 'No build needed for API-only project'"
+  },
+  "dependencies": {
+    "@vercel/kv": "^3.0.0",
+    "@vercel/node": "^4.0.0",
+    "mongodb": "^6.21.0"
+  },
+  "devDependencies": {
+    "vercel": "^41.0.2"
+  }
+}

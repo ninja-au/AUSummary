@@ -2,559 +2,761 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading.Tasks;
 using AUSUMMARY.Shared;
 using AUSUMMARY.Shared.Models;
 using BepInEx.Logging;
-using UnityEngine;
 
 namespace AUSUMMARY.DLL;
 
 /// <summary>
-/// Core class that tracks game state and generates summaries
+/// Tracks game progress and generates match summaries
 /// </summary>
 public static class GameTracker
 {
-    private static GameSummary? _currentGame;
+    private static ManualLogSource? _log;
+    private static GameSummary _currentGame = new();
     private static DateTime _gameStartTime;
-    private static bool _isTracking;
-    private static ManualLogSource? _logger;
+    private static bool _isGameActive;
 
-    /// <summary>
-    /// Initialize the game tracker
-    /// </summary>
-    public static void Initialize(ManualLogSource logger)
+    public static void Initialize(ManualLogSource log)
     {
-        _logger = logger;
-        _logger.LogInfo("GameTracker initialized");
-        
-        // Ensure output directory exists
-        var path = AUSummaryConstants.GetSummariesPath();
-        _logger.LogInfo($"Summaries directory: {path}");
+        _log = log;
+        DebugLog("GameTracker initialized");
     }
 
-    /// <summary>
-    /// Start tracking a new game
-    /// </summary>
+    #region Game Lifecycle
+
+    // ADDED: Missing method called by patches
     public static void StartGame()
     {
-        try
-        {
-            _logger?.LogInfo("Starting new game tracking...");
-            
-            _currentGame = new GameSummary
-            {
-                MatchId = Guid.NewGuid().ToString(),
-                Timestamp = DateTime.Now
-            };
-
-            _gameStartTime = DateTime.Now;
-            _isTracking = true;
-
-            // Capture initial metadata
-            CaptureGameMetadata();
-
-            // Add game start event
-            AddEvent(new GameEvent
-            {
-                EventType = "GameStart",
-                Timestamp = GetGameTime(),
-                Description = "Game started"
-            });
-
-            LogDebug($"Game tracking started: {_currentGame.MatchId}");
-        }
-        catch (Exception ex)
-        {
-            _logger?.LogError($"Error starting game tracking: {ex.Message}");
-        }
+        OnGameStart();
     }
 
-    /// <summary>
-    /// End game tracking and save summary
-    /// </summary>
+    // ADDED: Missing method called by patches (single parameter)
+    public static void EndGame(GameOverReason reason)
+    {
+        OnGameEnd(reason);
+    }
+
+    // ADDED: Overload for patches that pass winning team and condition
     public static void EndGame(string winningTeam, string winCondition)
     {
-        if (!_isTracking || _currentGame == null)
-        {
-            _logger?.LogWarning("Attempted to end game tracking but no active game");
-            return;
-        }
-
         try
         {
-            _logger?.LogInfo("Ending game tracking...");
+            if (!_isGameActive)
+                return;
 
-            // Capture modifiers at end of game
-            CaptureAllModifiers();
+            DebugLog("=== GAME ENDED ===");
+            _isGameActive = false;
 
-            // Set game duration
+            // Calculate game duration
             _currentGame.Metadata.GameDuration = DateTime.Now - _gameStartTime;
 
-            // Set winner information
+            // Update metadata
+            UpdateGameMetadata();
+
+            // Set winner from parameters
             _currentGame.Winner.WinningTeam = winningTeam;
             _currentGame.Winner.WinCondition = winCondition;
             _currentGame.Winner.Winners = _currentGame.Players
                 .Where(p => p.Team == winningTeam)
                 .Select(p => p.PlayerName)
                 .ToList();
-
-            // Calculate statistics
-            CalculateStatistics();
-
-            // Add game end event
-            AddEvent(new GameEvent
-            {
-                EventType = "GameEnd",
-                Timestamp = GetGameTime(),
-                Description = $"{winningTeam} wins by {winCondition}",
-                Data = new Dictionary<string, object>
-                {
-                    ["winningTeam"] = winningTeam,
-                    ["winners"] = _currentGame.Winner.Winners
-                }
-            });
-
-            // Save to file
-            SaveGameSummary();
-
-            LogDebug($"Game tracking ended: {_currentGame.MatchId}");
-        }
-        catch (Exception ex)
-        {
-            _logger?.LogError($"Error ending game tracking: {ex.Message}");
-        }
-        finally
-        {
-            _isTracking = false;
-            _currentGame = null;
-        }
-    }
-
-    /// <summary>
-    /// Capture player information including modifiers
-    /// </summary>
-    public static void CapturePlayerData(NetworkedPlayerInfo playerInfo, string role, string team, List<string> modifiers)
-    {
-        if (!_isTracking || _currentGame == null) return;
-
-        try
-        {
-            var existingPlayer = _currentGame.Players.FirstOrDefault(p => p.PlayerId == playerInfo.PlayerId);
             
-            if (existingPlayer != null)
+            // CRITICAL FIX: Correct player alive status based on actual game state
+            // Check the actual PlayerControl to see who is really alive
+            try
             {
-                // Update existing player
-                existingPlayer.Role = role;
-                existingPlayer.Team = team;
-                existingPlayer.Modifiers = modifiers;
-                existingPlayer.IsAlive = !playerInfo.IsDead;
-                
-                LogDebug($"Updated player: {existingPlayer.PlayerName} - {role} ({team}) Modifiers: {string.Join(", ", modifiers)}");
-            }
-            else
-            {
-                // Get actual color name
-                var colorName = GetColorName(playerInfo.DefaultOutfit.ColorId);
-
-                // Add new player
-                var newPlayer = new PlayerSnapshot
+                var allPlayers = PlayerControl.AllPlayerControls.ToArray();
+                foreach (var player in _currentGame.Players)
                 {
-                    PlayerName = playerInfo.PlayerName,
-                    PlayerId = playerInfo.PlayerId,
-                    ColorName = colorName,
-                    Role = role,
-                    Team = team,
-                    Modifiers = modifiers,
-                    IsAlive = !playerInfo.IsDead,
-                    TotalTasks = playerInfo.Tasks?.Count ?? 0
-                };
-                
-                _currentGame.Players.Add(newPlayer);
-                
-                LogDebug($"Added player: {newPlayer.PlayerName} ({colorName}) - {role} ({team}) Modifiers: {string.Join(", ", modifiers)}");
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger?.LogError($"Error capturing player data: {ex.Message}");
-        }
-    }
-
-    /// <summary>
-    /// Capture all players' modifiers at game end
-    /// </summary>
-    public static void CaptureAllModifiers()
-    {
-        if (!_isTracking || _currentGame == null) return;
-
-        try
-        {
-            _logger?.LogInfo("Capturing modifiers at game end...");
-            
-            foreach (var player in PlayerControl.AllPlayerControls)
-            {
-                if (player == null || player.Data == null) continue;
-
-                var modifiers = GetPlayerModifiers(player);
-                var existingPlayer = _currentGame.Players.FirstOrDefault(p => p.PlayerId == player.PlayerId);
-                
-                if (existingPlayer != null && modifiers.Any())
-                {
-                    existingPlayer.Modifiers = modifiers;
-                    LogDebug($"Updated {existingPlayer.PlayerName} modifiers: {string.Join(", ", modifiers)}");
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger?.LogError($"Error capturing all modifiers: {ex.Message}");
-        }
-    }
-
-    /// <summary>
-    /// Update a player's alive status (called at game end)
-    /// </summary>
-    public static void UpdatePlayerAliveStatus(byte playerId, bool isAlive)
-    {
-        try
-        {
-            if (_currentGame == null) return;
-
-            var player = _currentGame.Players.FirstOrDefault(p => p.PlayerId == playerId);
-            if (player != null)
-            {
-                player.IsAlive = isAlive;
-                
-                // If dead and we don't have death info, mark as dead with unknown cause
-                if (!isAlive && string.IsNullOrEmpty(player.DeathCause))
-                {
-                    player.DeathCause = "Unknown";
-                    if (string.IsNullOrEmpty(player.KillType))
-                        player.KillType = "Killed";
-                }
-                
-                LogDebug($"Updated alive status: {player.PlayerName} = {isAlive}");
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger?.LogError($"Error updating player alive status: {ex.Message}");
-        }
-    }
-
-    /// <summary>
-    /// Mark all players on the losing team as dead (used when game ends by kill)
-    /// </summary>
-    public static void MarkLosingTeamDead(string winningTeam)
-    {
-        try
-        {
-            if (_currentGame == null) return;
-
-            _logger?.LogInfo($"Marking losing team as dead. Winning team: {winningTeam}");
-
-            foreach (var player in _currentGame.Players)
-            {
-                // If this player's team is NOT the winning team, mark them as dead
-                if (player.Team != winningTeam)
-                {
-                    player.IsAlive = false;
-                    
-                    // If we don't have death details, add generic ones
-                    if (string.IsNullOrEmpty(player.DeathCause))
+                    var playerControl = allPlayers.FirstOrDefault(p => p.PlayerId == player.PlayerId);
+                    if (playerControl != null)
                     {
-                        player.DeathCause = "Killed";
-                    }
-                    if (string.IsNullOrEmpty(player.KillType))
-                    {
-                        player.KillType = "Killed";
-                    }
-                    
-                    LogDebug($"Marked {player.PlayerName} ({player.Team}) as dead (losing team)");
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger?.LogError($"Error marking losing team dead: {ex.Message}");
-        }
-    }
-
-    /// <summary>
-    /// Update death information for a player (used when RPC arrives after Die method)
-    /// </summary>
-    public static void UpdateDeathInfo(byte playerId, string killerName, string killType)
-    {
-        if (!_isTracking || _currentGame == null) return;
-
-        try
-        {
-            var player = _currentGame.Players.FirstOrDefault(p => p.PlayerId == playerId);
-            if (player != null)
-            {
-                // Update killer info
-                player.KilledBy = killerName;
-                player.KillType = killType;
-
-                // Increment killer's kill count if not already done
-                var killer = _currentGame.Players.FirstOrDefault(p => p.PlayerName == killerName);
-                if (killer != null)
-                {
-                    // Check if we already counted this kill
-                    var currentKillCount = killer.KillCount;
-                    var expectedKillCount = _currentGame.Players.Count(p => p.KilledBy == killerName && !p.IsAlive);
-                    
-                    if (currentKillCount < expectedKillCount)
-                    {
-                        killer.KillCount = expectedKillCount;
-                        LogDebug($"Updated {killerName} kill count to {killer.KillCount}");
+                        // Get the ACTUAL alive status from the game
+                        var actuallyAlive = !playerControl.Data?.IsDead ?? true;
+                        
+                        // Update our tracking to match reality
+                        if (actuallyAlive)
+                        {
+                            player.IsAlive = true;
+                            player.TimeOfDeath = null;
+                            player.DeathCause = null;
+                        }
+                        else if (!player.IsAlive && string.IsNullOrEmpty(player.DeathCause))
+                        {
+                            // Player is dead but we don't know why
+                            player.DeathCause = "Unknown";
+                        }
                     }
                 }
-
-                LogDebug($"Updated death info: {player.PlayerName} was {killType} by {killerName}");
             }
-        }
-        catch (Exception ex)
-        {
-            _logger?.LogError($"Error updating death info: {ex.Message}");
-        }
-    }
-
-    /// <summary>
-    /// Record a player death with kill type
-    /// </summary>
-    public static void RecordDeath(byte playerId, string cause, string? killerName = null, string? killType = null)
-    {
-        if (!_isTracking || _currentGame == null) return;
-
-        try
-        {
-            var player = _currentGame.Players.FirstOrDefault(p => p.PlayerId == playerId);
-            if (player != null)
+            catch (Exception ex)
             {
-                player.IsAlive = false;
-                player.DeathCause = cause;
-                player.KillType = killType ?? "Killed";
-                player.TimeOfDeath = GetGameTime();
-                player.KilledBy = killerName;
-                player.WasEjected = cause == "Ejected";
+                _log?.LogWarning($"Could not verify player alive status: {ex.Message}");
+            }
 
-                // Increment killer's kill count
-                if (killerName != null)
+            // Calculate final statistics
+            CalculateFinalStatistics();
+
+            AddGameEvent("GameEnd", $"Match ended: {winningTeam} wins ({winCondition})");
+
+            // CRITICAL: Save summary to file on main thread (accesses IL2CPP objects)
+            var savedFilePath = SaveGameSummary();
+
+            // CRITICAL: Read the saved JSON file instead of passing the IL2CPP object to background thread
+            // This avoids "Collecting from unknown thread" GC errors
+            if (!string.IsNullOrEmpty(savedFilePath) && File.Exists(savedFilePath))
+            {
+                var savedFilePathCopy = savedFilePath;
+                // Read JSON on main thread, then upload in background
+                var jsonToUpload = File.ReadAllText(savedFilePath);
+                Task.Run(async () => 
                 {
-                    var killer = _currentGame.Players.FirstOrDefault(p => p.PlayerName == killerName);
-                    if (killer != null)
+                    try
                     {
-                        killer.KillCount++;
+                        await VercelStatsSender.SendRawJsonAsync(jsonToUpload, savedFilePathCopy);
                     }
-                }
-
-                var statusText = player.IsAlive ? "Alive" : $"Dead ({player.KillType})";
-                LogDebug($"Recorded death: {player.PlayerName} - {statusText}" + (killerName != null ? $" by {killerName}" : ""));
-
-                AddEvent(new GameEvent
-                {
-                    EventType = "PlayerKilled",
-                    Timestamp = GetGameTime(),
-                    Description = $"{player.PlayerName} {statusText}" + (killerName != null ? $" by {killerName}" : ""),
-                    InvolvedPlayers = killerName != null ? new List<string> { player.PlayerName, killerName } : new List<string> { player.PlayerName },
-                    Data = new Dictionary<string, object>
+                    catch (Exception ex)
                     {
-                        ["killType"] = killType ?? "Killed",
-                        ["cause"] = cause
+                        // Log errors on main thread
+                        MainThreadDispatcher.Enqueue(() => 
+                            _log?.LogError($"Error uploading game: {ex.Message}"));
                     }
                 });
             }
-            else
+
+            DebugLog("Game summary saved successfully");
+        }
+        catch (Exception ex)
+        {
+            _log?.LogError($"Error ending game tracking: {ex.Message}\n{ex.StackTrace}");
+        }
+    }
+
+    public static void OnGameStart()
+    {
+        try
+        {
+            DebugLog("=== GAME STARTED ===");
+            _currentGame = new GameSummary
             {
-                _logger?.LogWarning($"Could not find player with ID {playerId} to record death");
+                MatchId = Guid.NewGuid().ToString(),
+                Timestamp = DateTime.Now
+            };
+            _gameStartTime = DateTime.Now;
+            _isGameActive = true;
+
+            // Capture metadata
+            CaptureGameMetadata();
+
+            // Capture all players
+            CapturePlayers();
+
+            AddGameEvent("GameStart", "Match began");
+            DebugLog($"Tracking {_currentGame.Players.Count} players");
+        }
+        catch (Exception ex)
+        {
+            _log?.LogError($"Error starting game tracking: {ex.Message}");
+        }
+    }
+
+    public static void OnGameEnd(GameOverReason endReason)
+    {
+        try
+        {
+            if (!_isGameActive)
+                return;
+
+            DebugLog("=== GAME ENDED ===");
+            _isGameActive = false;
+
+            // Calculate game duration
+            _currentGame.Metadata.GameDuration = DateTime.Now - _gameStartTime;
+
+            // Update metadata
+            UpdateGameMetadata();
+
+            // Determine winner
+            DetermineWinner(endReason);
+            
+            // CRITICAL FIX: Verify player alive status from actual game state
+            try
+            {
+                var allPlayers = PlayerControl.AllPlayerControls.ToArray();
+                foreach (var player in _currentGame.Players)
+                {
+                    var playerControl = allPlayers.FirstOrDefault(p => p.PlayerId == player.PlayerId);
+                    if (playerControl != null)
+                    {
+                        // Get the ACTUAL alive status from the game
+                        var actuallyAlive = !playerControl.Data?.IsDead ?? true;
+                        
+                        // Update our tracking to match reality
+                        if (actuallyAlive)
+                        {
+                            player.IsAlive = true;
+                            player.TimeOfDeath = null;
+                            player.DeathCause = null;
+                        }
+                        else if (!player.IsAlive && string.IsNullOrEmpty(player.DeathCause))
+                        {
+                            // Player is dead but we don't know why
+                            player.DeathCause = "Unknown";
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _log?.LogWarning($"Could not verify player alive status: {ex.Message}");
+            }
+
+            // Calculate final statistics
+            CalculateFinalStatistics();
+
+            AddGameEvent("GameEnd", $"Match ended: {endReason}");
+
+            // CRITICAL: Save summary to file on main thread (accesses IL2CPP objects)
+            var savedFilePath = SaveGameSummary();
+
+            // CRITICAL: Read the saved JSON file instead of passing the IL2CPP object to background thread
+            // This avoids "Collecting from unknown thread" GC errors
+            if (!string.IsNullOrEmpty(savedFilePath) && File.Exists(savedFilePath))
+            {
+                var savedFilePathCopy = savedFilePath;
+                // Read JSON on main thread, then upload in background
+                var jsonToUpload = File.ReadAllText(savedFilePath);
+                Task.Run(async () => 
+                {
+                    try
+                    {
+                        await VercelStatsSender.SendRawJsonAsync(jsonToUpload, savedFilePathCopy);
+                    }
+                    catch (Exception ex)
+                    {
+                        // Log errors on main thread
+                        MainThreadDispatcher.Enqueue(() => 
+                            _log?.LogError($"Error uploading game: {ex.Message}"));
+                    }
+                });
+            }
+
+            DebugLog("Game summary saved successfully");
+        }
+        catch (Exception ex)
+        {
+            _log?.LogError($"Error ending game tracking: {ex.Message}\n{ex.StackTrace}");
+        }
+    }
+
+    #endregion
+
+    #region Data Capture
+
+    // ADDED: Missing method called by patches
+    public static void CapturePlayerData(NetworkedPlayerInfo playerInfo, string roleName, string team, List<string> modifiers)
+    {
+        try
+        {
+            var snapshot = _currentGame.Players.FirstOrDefault(p => p.PlayerId == playerInfo.PlayerId);
+            if (snapshot != null)
+            {
+                snapshot.Role = roleName;
+                snapshot.Team = team;
+                // Store modifiers as comma-separated string or add to a list property
+                var modifierText = modifiers.Count > 0 ? string.Join(", ", modifiers) : "None";
+                DebugLog($"Updated player data: {snapshot.PlayerName} - {roleName} ({team}) [Modifiers: {modifierText}]");
             }
         }
         catch (Exception ex)
         {
-            _logger?.LogError($"Error recording death: {ex.Message}");
-        }
-    }
-
-    /// <summary>
-    /// Record a meeting being called
-    /// </summary>
-    public static void RecordMeeting(bool isEmergency, string? reporterName = null)
-    {
-        if (!_isTracking || _currentGame == null) return;
-
-        try
-        {
-            _currentGame.Metadata.TotalMeetings++;
-
-            AddEvent(new GameEvent
-            {
-                EventType = isEmergency ? "EmergencyMeeting" : "BodyReported",
-                Timestamp = GetGameTime(),
-                Description = isEmergency ? $"{reporterName} called emergency meeting" : $"{reporterName} reported a body",
-                InvolvedPlayers = reporterName != null ? new List<string> { reporterName } : new List<string>()
-            });
-        }
-        catch (Exception ex)
-        {
-            _logger?.LogError($"Error recording meeting: {ex.Message}");
-        }
-    }
-
-    /// <summary>
-    /// Record a task completion
-    /// </summary>
-    public static void RecordTaskComplete(byte playerId)
-    {
-        if (!_isTracking || _currentGame == null) return;
-
-        try
-        {
-            var player = _currentGame.Players.FirstOrDefault(p => p.PlayerId == playerId);
-            if (player != null)
-            {
-                player.TasksCompleted++;
-                _currentGame.Metadata.CompletedTasks++;
-                
-                LogDebug($"{player.PlayerName} completed task ({player.TasksCompleted}/{player.TotalTasks})");
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger?.LogError($"Error recording task completion: {ex.Message}");
-        }
-    }
-
-    #region Private Helper Methods
-
-    /// <summary>
-    /// Log debug information only if debug logging is enabled
-    /// </summary>
-    private static void LogDebug(string message)
-    {
-        if (AUSummaryPlugin.EnableDebugLogging)
-        {
-            _logger?.LogInfo($"[DEBUG] {message}");
+            _log?.LogError($"Error capturing player data: {ex.Message}");
         }
     }
 
     private static void CaptureGameMetadata()
     {
-        if (_currentGame == null) return;
-
-        try
-        {
-            _currentGame.Metadata.MapName = GetMapName();
-            _currentGame.Metadata.GameMode = "Town of Us";
-            _currentGame.Metadata.PlayerCount = GameData.Instance?.PlayerCount ?? 0;
-            _currentGame.Metadata.ModVersion = AUSummaryConstants.Version;
-        }
-        catch (Exception ex)
-        {
-            _logger?.LogError($"Error capturing game metadata: {ex.Message}");
-        }
-    }
-
-    private static string GetMapName()
-    {
         try
         {
             var shipStatus = ShipStatus.Instance;
-            if (shipStatus == null) return "Unknown";
+            if (shipStatus == null) return;
 
-            // Get the numeric value of the map type
-            var mapTypeValue = (int)shipStatus.Type;
+            _currentGame.Metadata.MapName = GetMapName(shipStatus.Type);
 
-            return shipStatus.Type switch
+            // FIXED: GameMode detection - use TryGet pattern or check type
+            try
             {
-                ShipStatus.MapType.Ship => "The Skeld",
-                ShipStatus.MapType.Hq => "MIRA HQ",
-                ShipStatus.MapType.Pb => "Polus",
-                _ => mapTypeValue switch
+                var gameOptions = GameOptionsManager.Instance?.CurrentGameOptions;
+                if (gameOptions != null)
                 {
-                    3 => "The Airship", // Airship if it exists in newer versions
-                    4 => "The Fungle",  // Fungle if it exists in newer versions
-                    _ => "Custom"       // Any other custom/modded maps
-                }
-            };
-        }
-        catch
-        {
-            return "Unknown";
-        }
-    }
-
-    private static string GetColorName(int colorId)
-    {
-        // Actual color names matching Among Us
-        var colorNames = new[]
-        {
-            "Red", "Blue", "Green", "Pink", "Orange", "Yellow",
-            "Black", "White", "Purple", "Brown", "Cyan", "Lime",
-            "Maroon", "Rose", "Banana", "Gray", "Tan", "Coral"
-        };
-
-        if (colorId >= 0 && colorId < colorNames.Length)
-            return colorNames[colorId];
-
-        return $"Color{colorId}";
-    }
-
-    private static List<string> GetPlayerModifiers(PlayerControl player)
-    {
-        var modifiers = new List<string>();
-
-        try
-        {
-            // Try to get modifier component using MiraAPI
-            var modifierComponentType = Type.GetType("MiraAPI.Modifiers.ModifierComponent, MiraAPI");
-            if (modifierComponentType == null) return modifiers;
-
-            var getComponentMethod = typeof(PlayerControl).GetMethod("GetComponent");
-            if (getComponentMethod == null) return modifiers;
-
-            var genericMethod = getComponentMethod.MakeGenericMethod(modifierComponentType);
-            var modifierComponent = genericMethod.Invoke(player, null);
-            
-            if (modifierComponent == null) return modifiers;
-
-            // Get all modifiers from the component
-            var modifiersProperty = modifierComponentType.GetProperty("AllModifiers");
-            if (modifiersProperty != null)
-            {
-                var allModifiers = modifiersProperty.GetValue(modifierComponent);
-                if (allModifiers != null)
-                {
-                    var enumerable = allModifiers as System.Collections.IEnumerable;
-                    if (enumerable != null)
+                    // Try to get game mode - different API versions have different properties
+                    var gameModeType = gameOptions.GetType().GetProperty("GameMode");
+                    if (gameModeType != null)
                     {
-                        foreach (var modifier in enumerable)
-                        {
-                            if (modifier == null) continue;
-                            
-                            var modifierType = modifier.GetType();
-                            
-                            // Try to get modifier name
-                            var nameProperty = modifierType.GetProperty("ModifierName");
-                            if (nameProperty != null)
-                            {
-                                var name = nameProperty.GetValue(modifier)?.ToString();
-                                if (!string.IsNullOrEmpty(name) && !modifiers.Contains(name))
-                                {
-                                    modifiers.Add(name);
-                                }
-                            }
-                        }
+                        var modeValue = gameModeType.GetValue(gameOptions);
+                        _currentGame.Metadata.GameMode = modeValue?.ToString() ?? "Classic";
+                    }
+                    else
+                    {
+                        // Fallback for older versions
+                        _currentGame.Metadata.GameMode = "Classic";
                     }
                 }
+                else
+                {
+                    _currentGame.Metadata.GameMode = "Classic";
+                }
+            }
+            catch
+            {
+                _currentGame.Metadata.GameMode = "Classic";
+            }
+
+            _currentGame.Metadata.ModVersion = AUSummaryConstants.Version;
+
+            DebugLog($"Map: {_currentGame.Metadata.MapName}, Mode: {_currentGame.Metadata.GameMode}");
+        }
+        catch (Exception ex)
+        {
+            _log?.LogError($"Error capturing metadata: {ex.Message}");
+        }
+    }
+
+    private static void CapturePlayers()
+    {
+        try
+        {
+            var allPlayers = PlayerControl.AllPlayerControls.ToArray();
+            _currentGame.Metadata.PlayerCount = allPlayers.Length;
+
+            foreach (var player in allPlayers)
+            {
+                if (player == null) continue;
+
+                var snapshot = new PlayerSnapshot
+                {
+                    PlayerName = player.Data?.PlayerName ?? "Unknown",
+                    PlayerId = player.PlayerId,
+                    ColorName = GetColorName(player.Data?.DefaultOutfit?.ColorId ?? 0),
+                    ColorId = player.Data?.DefaultOutfit?.ColorId ?? 0,
+                    HatId = player.Data?.DefaultOutfit?.HatId ?? "",
+                    PetId = player.Data?.DefaultOutfit?.PetId ?? "",
+                    SkinId = player.Data?.DefaultOutfit?.SkinId ?? "",
+                    VisorId = player.Data?.DefaultOutfit?.VisorId ?? "",
+                    NameplateId = player.Data?.DefaultOutfit?.NamePlateId ?? "",
+                    IsAlive = !player.Data?.IsDead ?? true,
+                    TotalTasks = player.Data?.Tasks?.Count ?? 0
+                };
+
+                // Get role information (will be updated during intro)
+                UpdatePlayerRole(snapshot, player);
+
+                _currentGame.Players.Add(snapshot);
+                DebugLog($"Captured player: {snapshot.PlayerName} ({snapshot.ColorName}) - Hat:{snapshot.HatId}");
             }
         }
         catch (Exception ex)
         {
-            _logger?.LogWarning($"Error getting modifiers for {player.Data.PlayerName}: {ex.Message}");
+            _log?.LogError($"Error capturing players: {ex.Message}");
         }
+    }
 
-        return modifiers;
+    private static void UpdatePlayerRole(PlayerSnapshot snapshot, PlayerControl player)
+    {
+        try
+        {
+            if (player?.Data?.Role == null) return;
+
+            snapshot.Role = player.Data.Role.NiceName ?? player.Data.Role.Role.ToString();
+            snapshot.Team = player.Data.Role.TeamType switch
+            {
+                RoleTeamTypes.Crewmate => "Crewmate",
+                RoleTeamTypes.Impostor => "Impostor",
+                _ => "Unknown"
+            };
+
+            DebugLog($"Updated {snapshot.PlayerName} role: {snapshot.Role} ({snapshot.Team})");
+        }
+        catch (Exception ex)
+        {
+            _log?.LogError($"Error updating player role: {ex.Message}");
+        }
+    }
+
+    private static void UpdateGameMetadata()
+    {
+        try
+        {
+            // Count meetings
+            _currentGame.Metadata.TotalMeetings = _currentGame.Events
+                .Count(e => e.EventType == "MeetingCalled" || e.EventType == "BodyReported");
+
+            // CRITICAL FIX: Only count tasks for players who can ACTUALLY complete tasks
+            // Impostors have fake tasks that don't contribute to the task bar
+            // Only count tasks for Crewmates and roles that can do tasks
+            int totalTasks = 0;
+            int completedTasks = 0;
+
+            foreach (var player in _currentGame.Players)
+            {
+                // Skip impostors - they have fake tasks that don't count
+                if (player.Team == "Impostor")
+                {
+                    DebugLog($"Skipping tasks for {player.PlayerName} (Impostor)");
+                    continue;
+                }
+                
+                // Only count crewmate tasks (and neutral roles that can do tasks)
+                totalTasks += player.TotalTasks;
+                completedTasks += player.TasksCompleted;
+            }
+
+            _currentGame.Metadata.TotalTasks = totalTasks;
+            _currentGame.Metadata.CompletedTasks = completedTasks;
+            
+            DebugLog($"Task count: {completedTasks}/{totalTasks} (excluding impostor fake tasks)");
+        }
+        catch (Exception ex)
+        {
+            _log?.LogError($"Error updating game metadata: {ex.Message}");
+        }
+    }
+
+    #endregion
+
+    #region Event Tracking
+
+    // ADDED: Missing method called by patches (2 parameters)
+    public static void RecordDeath(PlayerControl player, DeathReason reason)
+    {
+        OnPlayerDeath(player, reason);
+    }
+
+    // ADDED: Overload for patches that pass more details (4 parameters)
+    public static void RecordDeath(byte playerId, string deathCause, string? killerName, string killType)
+    {
+        try
+        {
+            var snapshot = _currentGame.Players.FirstOrDefault(p => p.PlayerId == playerId);
+            if (snapshot == null) return;
+
+            snapshot.IsAlive = false;
+            snapshot.TimeOfDeath = GetGameTime();
+            snapshot.DeathCause = killType ?? deathCause;
+
+            var description = string.IsNullOrEmpty(killerName)
+                ? $"{snapshot.PlayerName} died: {killType}"
+                : $"{snapshot.PlayerName} was {killType} by {killerName}";
+
+            AddGameEvent("PlayerKilled", description, new[] { snapshot.PlayerName });
+            DebugLog($"Player death: {description}");
+        }
+        catch (Exception ex)
+        {
+            _log?.LogError($"Error recording death: {ex.Message}");
+        }
+    }
+
+    // ADDED: Missing method called by patches (single PlayerControl parameter)
+    public static void RecordMeeting(PlayerControl caller)
+    {
+        OnMeetingCalled(caller);
+    }
+
+    // ADDED: Overload for patches that pass meeting type and caller name (2 parameters)
+    public static void RecordMeeting(bool isEmergency, string callerName)
+    {
+        try
+        {
+            var eventType = isEmergency ? "MeetingCalled" : "BodyReported";
+            var description = isEmergency
+                ? $"{callerName} called an emergency meeting"
+                : $"{callerName} reported a body";
+
+            AddGameEvent(eventType, description, new[] { callerName });
+            DebugLog($"Meeting: {description}");
+        }
+        catch (Exception ex)
+        {
+            _log?.LogError($"Error recording meeting: {ex.Message}");
+        }
+    }
+
+    // ADDED: Missing method called by patches (PlayerControl parameter)
+    public static void RecordTaskComplete(PlayerControl player)
+    {
+        OnTaskCompleted(player);
+    }
+
+    // ADDED: Overload for patches that pass byte playerId
+    public static void RecordTaskComplete(byte playerId)
+    {
+        try
+        {
+            var snapshot = _currentGame.Players.FirstOrDefault(p => p.PlayerId == playerId);
+            if (snapshot != null)
+            {
+                snapshot.TasksCompleted++;
+                DebugLog($"{snapshot.PlayerName} completed task: {snapshot.TasksCompleted}/{snapshot.TotalTasks}");
+            }
+        }
+        catch (Exception ex)
+        {
+            _log?.LogError($"Error tracking task completion: {ex.Message}");
+        }
+    }
+
+    // ADDED: Missing method called by patches
+    public static void UpdatePlayerAliveStatus(byte playerId, bool isAlive)
+    {
+        try
+        {
+            var snapshot = _currentGame.Players.FirstOrDefault(p => p.PlayerId == playerId);
+            if (snapshot != null)
+            {
+                snapshot.IsAlive = isAlive;
+                if (!isAlive && snapshot.TimeOfDeath == 0)
+                {
+                    snapshot.TimeOfDeath = GetGameTime();
+                }
+                DebugLog($"Updated {snapshot.PlayerName} alive status: {isAlive}");
+            }
+        }
+        catch (Exception ex)
+        {
+            _log?.LogError($"Error updating player alive status: {ex.Message}");
+        }
+    }
+
+    // ADDED: Missing method called by patches
+    public static void UpdateDeathInfo(byte playerId, string killer, string deathCause)
+    {
+        try
+        {
+            var snapshot = _currentGame.Players.FirstOrDefault(p => p.PlayerId == playerId);
+            if (snapshot != null)
+            {
+                snapshot.IsAlive = false;
+                snapshot.DeathCause = deathCause;
+                snapshot.TimeOfDeath = GetGameTime();
+                DebugLog($"Updated death info: {snapshot.PlayerName} killed by {killer} - {deathCause}");
+            }
+        }
+        catch (Exception ex)
+        {
+            _log?.LogError($"Error updating death info: {ex.Message}");
+        }
+    }
+
+    // ADDED: Missing method called by patches
+    public static void MarkLosingTeamDead(string losingTeam)
+    {
+        try
+        {
+            // CRITICAL FIX: Only mark players as dead if they're actually on the LOSING team
+            // Winners who survived should stay alive
+            // Only players who were already dead or are on losing team should be marked
+            
+            foreach (var player in _currentGame.Players.Where(p => p.Team == losingTeam))
+            {
+                // If player is already alive and on losing team, they probably survived
+                // Don't mark them as dead with "GameEnd" - they might be winners!
+                // Only mark as dead if they don't have a TimeOfDeath (never died during game)
+                if (player.IsAlive && player.TimeOfDeath == null)
+                {
+                    // This player survived the whole game on the losing team
+                    // They should stay alive - don't mark as dead
+                    continue;
+                }
+                
+                // If player has no death cause but is dead, mark it as GameEnd
+                if (!player.IsAlive && string.IsNullOrEmpty(player.DeathCause))
+                {
+                    player.DeathCause = "GameEnd";
+                }
+            }
+            DebugLog($"Processed {losingTeam} team end-of-game status");
+        }
+        catch (Exception ex)
+        {
+            _log?.LogError($"Error marking losing team dead: {ex.Message}");
+        }
+    }
+
+    public static void OnPlayerDeath(PlayerControl player, DeathReason reason)
+    {
+        try
+        {
+            var snapshot = _currentGame.Players.FirstOrDefault(p => p.PlayerId == player.PlayerId);
+            if (snapshot == null) return;
+
+            snapshot.IsAlive = false;
+            snapshot.TimeOfDeath = GetGameTime();
+            snapshot.DeathCause = reason.ToString();
+
+            AddGameEvent("PlayerKilled", $"{snapshot.PlayerName} died: {reason}", new[] { snapshot.PlayerName });
+            DebugLog($"Player death: {snapshot.PlayerName} - {reason}");
+        }
+        catch (Exception ex)
+        {
+            _log?.LogError($"Error tracking player death: {ex.Message}");
+        }
+    }
+
+    public static void OnMeetingCalled(PlayerControl caller)
+    {
+        try
+        {
+            var callerName = caller?.Data?.PlayerName ?? "Unknown";
+            AddGameEvent("MeetingCalled", $"{callerName} called an emergency meeting", new[] { callerName });
+            DebugLog($"Meeting called by {callerName}");
+        }
+        catch (Exception ex)
+        {
+            _log?.LogError($"Error tracking meeting: {ex.Message}");
+        }
+    }
+
+    public static void OnBodyReported(PlayerControl reporter, NetworkedPlayerInfo deadBody)
+    {
+        try
+        {
+            var reporterName = reporter?.Data?.PlayerName ?? "Unknown";
+            var deadName = deadBody?.PlayerName ?? "Unknown";
+            AddGameEvent("BodyReported", $"{reporterName} reported {deadName}'s body", new[] { reporterName, deadName });
+            DebugLog($"Body reported: {deadName} by {reporterName}");
+        }
+        catch (Exception ex)
+        {
+            _log?.LogError($"Error tracking body report: {ex.Message}");
+        }
+    }
+
+    public static void OnTaskCompleted(PlayerControl player)
+    {
+        try
+        {
+            var snapshot = _currentGame.Players.FirstOrDefault(p => p.PlayerId == player.PlayerId);
+            if (snapshot != null)
+            {
+                snapshot.TasksCompleted++;
+                DebugLog($"{snapshot.PlayerName} completed task: {snapshot.TasksCompleted}/{snapshot.TotalTasks}");
+            }
+        }
+        catch (Exception ex)
+        {
+            _log?.LogError($"Error tracking task completion: {ex.Message}");
+        }
+    }
+
+    public static void OnPlayerEjected(NetworkedPlayerInfo ejected, bool wasTie)
+    {
+        try
+        {
+            if (ejected == null) return;
+
+            var snapshot = _currentGame.Players.FirstOrDefault(p => p.PlayerId == ejected.PlayerId);
+            if (snapshot != null)
+            {
+                snapshot.IsAlive = false;
+                snapshot.WasEjected = true;
+                snapshot.TimeOfDeath = GetGameTime();
+                snapshot.DeathCause = "Ejected";
+            }
+
+            var message = wasTie ? $"Tie vote - {ejected.PlayerName} was ejected" : $"{ejected.PlayerName} was ejected";
+            AddGameEvent("PlayerEjected", message, new[] { ejected.PlayerName });
+            DebugLog($"Player ejected: {ejected.PlayerName}");
+        }
+        catch (Exception ex)
+        {
+            _log?.LogError($"Error tracking ejection: {ex.Message}");
+        }
+    }
+
+    #endregion
+
+    #region Statistics and Winners
+
+    private static void DetermineWinner(GameOverReason reason)
+    {
+        try
+        {
+            _currentGame.Winner.WinCondition = reason.ToString();
+
+            // FIXED: Use only valid GameOverReason enum values
+            // Check the actual enum value as integer to handle any version
+            var reasonValue = (int)reason;
+            var reasonName = reason.ToString();
+
+            // Try to determine team based on reason name
+            if (reasonName.Contains("Human") || reasonName.Contains("Crewmate") || reasonName.Contains("Task"))
+            {
+                _currentGame.Winner.WinningTeam = "Crewmate";
+                _currentGame.Winner.Winners = _currentGame.Players
+                    .Where(p => p.Team == "Crewmate")
+                    .Select(p => p.PlayerName)
+                    .ToList();
+            }
+            else if (reasonName.Contains("Impostor") || reasonName.Contains("Sabotage") || reasonName.Contains("Kill"))
+            {
+                _currentGame.Winner.WinningTeam = "Impostor";
+                _currentGame.Winner.Winners = _currentGame.Players
+                    .Where(p => p.Team == "Impostor")
+                    .Select(p => p.PlayerName)
+                    .ToList();
+            }
+            else
+            {
+                _currentGame.Winner.WinningTeam = "Unknown";
+            }
+
+            DebugLog($"Winner determined: {_currentGame.Winner.WinningTeam} by {reason}");
+        }
+        catch (Exception ex)
+        {
+            _log?.LogError($"Error determining winner: {ex.Message}");
+        }
+    }
+
+    private static void CalculateFinalStatistics()
+    {
+        try
+        {
+            _currentGame.Statistics.TotalKills = _currentGame.Players.Sum(p => p.KillCount);
+            _currentGame.Statistics.TotalDeaths = _currentGame.Players.Count(p => !p.IsAlive);
+            _currentGame.Statistics.TotalEjections = _currentGame.Players.Count(p => p.WasEjected);
+
+            var totalTasks = _currentGame.Players.Sum(p => p.TotalTasks);
+            var completedTasks = _currentGame.Players.Sum(p => p.TasksCompleted);
+            _currentGame.Statistics.TaskCompletionRate = totalTasks > 0 ? (float)completedTasks / totalTasks : 0f;
+
+            DebugLog($"Final stats - Kills: {_currentGame.Statistics.TotalKills}, Deaths: {_currentGame.Statistics.TotalDeaths}");
+        }
+        catch (Exception ex)
+        {
+            _log?.LogError($"Error calculating statistics: {ex.Message}");
+        }
+    }
+
+    #endregion
+
+    #region Helpers
+
+    private static void AddGameEvent(string eventType, string description, string[]? involvedPlayers = null)
+    {
+        var gameEvent = new GameEvent
+        {
+            EventType = eventType,
+            Timestamp = GetGameTime(),
+            Description = description,
+            InvolvedPlayers = involvedPlayers?.ToList() ?? new List<string>()
+        };
+
+        _currentGame.Events.Add(gameEvent);
     }
 
     private static float GetGameTime()
@@ -562,64 +764,61 @@ public static class GameTracker
         return (float)(DateTime.Now - _gameStartTime).TotalSeconds;
     }
 
-    private static void AddEvent(GameEvent gameEvent)
+    private static string GetMapName(ShipStatus.MapType mapType)
     {
-        if (_currentGame == null) return;
-        _currentGame.Events.Add(gameEvent);
+        // FIXED: Use reflection to handle different Among Us versions
+        var mapName = mapType.ToString();
+
+        return mapName switch
+        {
+            "Ship" => "The Skeld",
+            "Hq" => "MIRA HQ",
+            "Pb" => "Polus",
+            "Airship" => "The Airship",
+            "Fungle" => "The Fungle",
+            _ => mapName // Return the enum name if unknown
+        };
     }
 
-    private static void CalculateStatistics()
+    private static string GetColorName(int colorId)
     {
-        if (_currentGame == null) return;
-
-        try
-        {
-            // Count total deaths (all dead players)
-            _currentGame.Statistics.TotalDeaths = _currentGame.Players.Count(p => !p.IsAlive);
-            
-            // Count kills from player kill counts
-            _currentGame.Statistics.TotalKills = _currentGame.Players.Sum(p => p.KillCount);
-            
-            // Count ejections
-            _currentGame.Statistics.TotalEjections = _currentGame.Players.Count(p => p.WasEjected);
-            
-            var totalTasks = _currentGame.Players.Sum(p => p.TotalTasks);
-            var completedTasks = _currentGame.Metadata.CompletedTasks;
-            _currentGame.Statistics.TaskCompletionRate = totalTasks > 0 ? (float)completedTasks / totalTasks : 0;
-
-            _currentGame.Metadata.TotalTasks = totalTasks;
-            
-            LogDebug($"Statistics calculated: {_currentGame.Statistics.TotalKills} kills, {_currentGame.Statistics.TotalDeaths} deaths, {_currentGame.Statistics.TotalEjections} ejections");
-        }
-        catch (Exception ex)
-        {
-            _logger?.LogError($"Error calculating statistics: {ex.Message}");
-        }
+        // Basic color names - can be expanded
+        var colors = new[] { "Red", "Blue", "Green", "Pink", "Orange", "Yellow", "Black", "White",
+            "Purple", "Brown", "Cyan", "Lime", "Maroon", "Rose", "Banana", "Gray", "Tan", "Coral" };
+        return colorId >= 0 && colorId < colors.Length ? colors[colorId] : "Unknown";
     }
 
-    private static void SaveGameSummary()
+    private static string? SaveGameSummary()
     {
-        if (_currentGame == null) return;
-
         try
         {
-            var filePath = AUSummaryConstants.GetSummaryFilePath(_currentGame.MatchId);
-            
-            // Use System.Text.Json instead to avoid conflicts
+            var summariesPath = AUSummaryConstants.GetSummariesPath();
+            Directory.CreateDirectory(summariesPath);
+
+            var fileName = $"GameSummary_{_currentGame.Timestamp:yyyyMMdd_HHmmss}_{_currentGame.MatchId.Substring(0, 8)}.json";
+            var filePath = Path.Combine(summariesPath, fileName);
+
+            // Use System.Text.Json instead to avoid IL2CPP conflicts
             var json = System.Text.Json.JsonSerializer.Serialize(_currentGame, new System.Text.Json.JsonSerializerOptions
             {
                 WriteIndented = true
             });
-            
             File.WriteAllText(filePath, json);
-            
-            _logger?.LogInfo($"Game summary saved: {filePath}");
+
+            _log?.LogInfo($"Game summary saved: {fileName}");
+            return filePath;
         }
         catch (Exception ex)
         {
-            _logger?.LogError($"Error saving game summary: {ex.Message}");
-            _logger?.LogError($"Stack trace: {ex.StackTrace}");
+            _log?.LogError($"Error saving game summary: {ex.Message}\n{ex.StackTrace}");
+            return null;
         }
+    }
+
+    private static void DebugLog(string message)
+    {
+        if (AUSummaryPlugin.EnableDebugLogging)
+            _log?.LogInfo($"[GameTracker] {message}");
     }
 
     #endregion

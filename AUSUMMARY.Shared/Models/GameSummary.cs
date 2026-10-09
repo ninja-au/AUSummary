@@ -75,6 +75,24 @@ public class PlayerSnapshot
     [JsonProperty("colorName")]
     public string ColorName { get; set; } = "";
 
+    [JsonProperty("colorId")]
+    public int ColorId { get; set; }
+
+    [JsonProperty("hatId")]
+    public string HatId { get; set; } = "";
+
+    [JsonProperty("petId")]
+    public string PetId { get; set; } = "";
+
+    [JsonProperty("skinId")]
+    public string SkinId { get; set; } = "";
+
+    [JsonProperty("visorId")]
+    public string VisorId { get; set; } = "";
+
+    [JsonProperty("nameplateId")]
+    public string NameplateId { get; set; } = "";
+
     [JsonProperty("role")]
     public string Role { get; set; } = "Crewmate";
 

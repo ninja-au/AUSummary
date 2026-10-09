@@ -25,7 +25,9 @@ public static class TaskPatches
     }
 
     /// <summary>
-    /// Patch for when a task is marked as complete - FIXED for multi-part + Better logging
+    /// Patch for when a task is marked as complete
+    /// CRITICAL: GameData.CompleteTask is only called when a FULL task is complete
+    /// This is called by the game AFTER all parts are done, so we don't need to check IsComplete
     /// </summary>
     [HarmonyPatch(typeof(GameData), nameof(GameData.CompleteTask))]
     [HarmonyPrefix]
@@ -52,46 +54,41 @@ public static class TaskPatches
                 return;
             }
 
-            // Check if this is a multi-part task - manually iterate Il2Cpp list
-            PlayerTask? foundTask = null;
-            if (pc.myTasks != null)
+            // CRITICAL FIX: Check if we've already counted this task FIRST
+            // This prevents double-counting if CompleteTask is called multiple times
+            if (_completedTasks.Contains(taskId))
             {
-                foreach (var task in pc.myTasks)
+                AUSummaryPlugin.Instance.Log.LogInfo($"[TASK ALREADY COUNTED] Task ID {taskId} for {pc.Data.PlayerName} already recorded");
+                return;
+            }
+
+            // CRITICAL INSIGHT: GameData.CompleteTask is ONLY called when a task is FULLY complete
+            // The game handles multi-part tasks internally and only calls this when ALL parts are done
+            // So we can trust this call and don't need to check IsComplete!
+            
+            // Get task name for logging (optional, might fail)
+            string taskName = "Unknown Task";
+            try
+            {
+                if (pc.myTasks != null)
                 {
-                    if (task != null && task.Id == taskId)
+                    foreach (var task in pc.myTasks)
                     {
-                        foundTask = task;
-                        break;
+                        if (task != null && task.Id == taskId)
+                        {
+                            taskName = task.TaskType.ToString();
+                            break;
+                        }
                     }
                 }
             }
+            catch { }
 
-            if (foundTask == null)
-            {
-                AUSummaryPlugin.Instance.Log.LogWarning($"Task {taskId} not found for {pc.Data.PlayerName}");
-                return;
-            }
-
-            // Only count the task if it's fully complete (not just one part)
-            // Multi-part tasks: Only count when IsComplete is true
-            if (!foundTask.IsComplete)
-            {
-                AUSummaryPlugin.Instance.Log.LogInfo($"[TASK PART] {pc.Data.PlayerName} completed part of {foundTask.TaskType} (not fully complete yet)");
-                return;
-            }
-
-            // Check if we've already counted this task
-            if (_completedTasks.Contains(taskId))
-            {
-                AUSummaryPlugin.Instance.Log.LogInfo($"[TASK ALREADY COUNTED] {pc.Data.PlayerName}'s {foundTask.TaskType} already recorded");
-                return;
-            }
-
-            // Mark as counted
+            // Task is complete - count it!
             _completedTasks.Add(taskId);
             _taskCounter++;
             
-            AUSummaryPlugin.Instance.Log.LogWarning($"✅ [TASK #{_taskCounter}] {pc.Data.PlayerName} completed {foundTask.TaskType}");
+            AUSummaryPlugin.Instance.Log.LogWarning($"✅ TASK COMPLETE #{_taskCounter}: {pc.Data.PlayerName} finished {taskName} (Task ID: {taskId})");
             GameTracker.RecordTaskComplete(pc.PlayerId);
         }
         catch (Exception ex)
@@ -101,7 +98,8 @@ public static class TaskPatches
     }
 
     /// <summary>
-    /// Alternative patch that checks task completion properly
+    /// Alternative patch that checks task completion at the source
+    /// This catches when PlayerTask.Complete is called directly
     /// </summary>
     [HarmonyPatch(typeof(PlayerTask), nameof(PlayerTask.Complete))]
     [HarmonyPostfix]
@@ -114,16 +112,25 @@ public static class TaskPatches
             var owner = __instance.Owner;
             if (owner == null || owner.Data == null) return;
 
-            // Only log when task becomes complete
-            if (__instance.IsComplete)
+            // IMPORTANT: Check if player is impostor or dead
+            if (owner.Data.Role != null && owner.Data.Role.IsImpostor)
             {
-                // Check if already counted
-                if (_completedTasks.Contains(__instance.Id))
-                {
-                    return; // Already counted
-                }
+                return; // Impostor fake task
+            }
 
-                AUSummaryPlugin.Instance.Log.LogInfo($"[TASK COMPLETE POSTFIX] {owner.Data.PlayerName} completed {__instance.TaskType}");
+            if (owner.Data.IsDead)
+            {
+                return; // Dead players don't count
+            }
+
+            // Only count when task becomes complete AND hasn't been counted yet
+            if (__instance.IsComplete && !_completedTasks.Contains(__instance.Id))
+            {
+                _completedTasks.Add(__instance.Id);
+                _taskCounter++;
+                
+                AUSummaryPlugin.Instance.Log.LogWarning($"✅ TASK COMPLETE (PlayerTask patch) #{_taskCounter}: {owner.Data.PlayerName} finished {__instance.TaskType}");
+                GameTracker.RecordTaskComplete(owner.PlayerId);
             }
         }
         catch (Exception ex)
